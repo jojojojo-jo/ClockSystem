@@ -41,19 +41,15 @@ def parse_ts(ts_val):
     """Parses text timestamps (YYYY-MM-DD HH:MM, DD.MM.YY HH:MM, etc.) AND Excel numeric serial dates."""
     s = str(ts_val).strip()
 
-    # 1. Handle Excel numeric serial date/time (e.g., "46350.52986111111")
     try:
         serial = float(s)
-        # Excel's day 0 is 1899-12-30 (accounting for Excel's 1900 leap-year bug)
         dt = datetime(1899, 12, 30) + timedelta(days=serial)
-        # Round to nearest minute to avoid floating-point 12:42:59.999 drift
         if dt.second >= 30:
             dt += timedelta(minutes=1)
         return dt.replace(second=0, microsecond=0)
     except ValueError:
         pass
 
-    # 2. Handle standard & European/German text date-time formats
     formats = (
         "%Y-%m-%d %H:%M",
         "%Y-%m-%d %H:%M:%S",
@@ -195,6 +191,7 @@ def write_native_xlsx(filepath, sheets):
         "<sheets>" + "".join(workbook_sheets) + "</sheets></workbook>"
     )
 
+    # numFmtId="49" (@ Text format) prevents Excel from auto-reformatting typed timestamps
     styles_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <fonts count="4">
@@ -239,7 +236,6 @@ def write_native_xlsx(filepath, sheets):
 
 
 def export_single_day_xlsx(target_date, all_rows):
-    """Creates Warehouse_Report_YYYY-MM-DD.xlsx with HH:MM timestamps and break columns."""
     day_rows = [r for r in all_rows if r["Date"] == target_date]
     if not day_rows:
         return None
@@ -370,8 +366,52 @@ def generate_excel_reports(target_date=None):
     return True, f"Generated {len(created_files)} daily Excel file(s): {', '.join(created_files)}"
 
 
+def _parse_xlsx_sheet(zf, sheet_name, shared_strings, ns_main):
+    """Helper to extract rows from a specific named worksheet inside an open .xlsx ZipFile."""
+    wb_root = ET.fromstring(zf.read("xl/workbook.xml"))
+    rels_root = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+    rel_map = {rel.attrib["Id"]: rel.attrib["Target"] for rel in rels_root}
+
+    target_sheet_path = None
+    for sheet in wb_root.findall(".//m:sheet", ns_main):
+        if sheet.attrib.get("name") == sheet_name:
+            rid = sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+            target = rel_map.get(rid, "")
+            target_sheet_path = target if target.startswith("xl/") else f"xl/{target}"
+            break
+
+    if not target_sheet_path or target_sheet_path not in zf.namelist():
+        return None
+
+    ws_root = ET.fromstring(zf.read(target_sheet_path))
+    parsed_rows = []
+    for row_el in ws_root.findall(".//m:sheetData/m:row", ns_main):
+        row_vals = {}
+        for c_el in row_el.findall("m:c", ns_main):
+            c_idx = _col_index_from_ref(c_el.attrib.get("r", "A1"))
+            c_type = c_el.attrib.get("t", "")
+            val = ""
+            if c_type == "s":
+                v_el = c_el.find("m:v", ns_main)
+                if v_el is not None and v_el.text is not None:
+                    val = shared_strings[int(v_el.text)]
+            elif c_type == "inlineStr":
+                t_el = c_el.find(".//m:t", ns_main)
+                val = t_el.text if (t_el is not None and t_el.text) else ""
+            else:
+                v_el = c_el.find("m:v", ns_main)
+                val = v_el.text if (v_el is not None and v_el.text) else ""
+            row_vals[c_idx] = val.strip()
+
+        if row_vals:
+            max_c = max(row_vals.keys())
+            parsed_rows.append([row_vals.get(i, "") for i in range(max_c + 1)])
+
+    return parsed_rows
+
+
 def sync_from_native_xlsx(target_date):
-    """Reads edited rows from Warehouse_Report_YYYY-MM-DD.xlsx (accepts HH:MM or HH:MM:SS), updates raw_logs.csv, and refreshes the daily Excel file."""
+    """Syncs both the Workers tab (to workers.csv) and Raw_Logs tab (to raw_logs.csv) from Warehouse_Report_YYYY-MM-DD.xlsx."""
     filepath = f"{REPORT_PREFIX}{target_date}.xlsx"
     if not os.path.exists(filepath):
         return False, f"{filepath} not found. Export the Excel file first."
@@ -387,79 +427,70 @@ def sync_from_native_xlsx(target_date):
                     text_parts = [t.text or "" for t in si.findall(".//m:t", ns_main)]
                     shared_strings.append("".join(text_parts))
 
-            wb_root = ET.fromstring(zf.read("xl/workbook.xml"))
-            rels_root = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
-            rel_map = {rel.attrib["Id"]: rel.attrib["Target"] for rel in rels_root}
+            raw_parsed = _parse_xlsx_sheet(zf, "Raw_Logs", shared_strings, ns_main)
+            workers_parsed = _parse_xlsx_sheet(zf, "Workers", shared_strings, ns_main)
 
-            target_sheet_path = None
-            for sheet in wb_root.findall(".//m:sheet", ns_main):
-                if sheet.attrib.get("name") == "Raw_Logs":
-                    rid = sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
-                    target = rel_map.get(rid, "")
-                    target_sheet_path = target if target.startswith("xl/") else f"xl/{target}"
-                    break
+        if raw_parsed is None:
+            return False, "Could not find the 'Raw_Logs' tab inside the Excel workbook."
 
-            if not target_sheet_path or target_sheet_path not in zf.namelist():
-                return False, "Could not find the 'Raw_Logs' tab inside the Excel workbook."
-
-            ws_root = ET.fromstring(zf.read(target_sheet_path))
-            parsed_rows = []
-            for row_el in ws_root.findall(".//m:sheetData/m:row", ns_main):
-                row_vals = {}
-                for c_el in row_el.findall("m:c", ns_main):
-                    c_idx = _col_index_from_ref(c_el.attrib.get("r", "A1"))
-                    c_type = c_el.attrib.get("t", "")
-                    val = ""
-                    if c_type == "s":
-                        v_el = c_el.find("m:v", ns_main)
-                        if v_el is not None and v_el.text is not None:
-                            val = shared_strings[int(v_el.text)]
-                    elif c_type == "inlineStr":
-                        t_el = c_el.find(".//m:t", ns_main)
-                        val = t_el.text if (t_el is not None and t_el.text) else ""
-                    else:
-                        v_el = c_el.find("m:v", ns_main)
-                        val = v_el.text if (v_el is not None and v_el.text) else ""
-                    row_vals[c_idx] = val.strip()
-
-                if row_vals:
-                    max_c = max(row_vals.keys())
-                    parsed_rows.append([row_vals.get(i, "") for i in range(max_c + 1)])
-
-        if len(parsed_rows) < 2:
-            return False, "No data rows found in the Raw_Logs tab."
-
-        headers = parsed_rows[0]
+        # 1. Sync Workers tab -> workers.csv (if Workers tab exists and has rows)
         workers_map = load_workers()
+        if workers_parsed and len(workers_parsed) >= 2:
+            w_headers = workers_parsed[0]
+            updated_workers = {}
+            for r in workers_parsed[1:]:
+                w_dict = {w_headers[i]: (r[i] if i < len(r) else "") for i in range(len(w_headers))}
+                wid = w_dict.get("Worker_ID", "").strip()
+                wname = w_dict.get("Worker_Name", "").strip()
+                # Normalize float-formatted IDs if Excel turned "1355" into "1355.0"
+                if wid.endswith(".0"):
+                    wid = wid[:-2]
+                if wid and wname:
+                    updated_workers[wid] = wname
+
+            if updated_workers:
+                workers_map = updated_workers
+                with open(WORKERS_FILE, "w", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["Worker_ID", "Worker_Name"])
+                    for wid, wname in sorted(workers_map.items()):
+                        writer.writerow([wid, wname])
+
+        # 2. Sync Raw_Logs tab -> raw_logs.csv
         updated_day_rows = []
         affected_workers = set()
 
-        for r in parsed_rows[1:]:
-            row_dict = {headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))}
-            ts = row_dict.get("Timestamp", "").strip()
-            wid = row_dict.get("Worker_ID", "").strip()
-            if not ts or not wid:
-                continue
+        if len(raw_parsed) >= 2:
+            headers = raw_parsed[0]
+            for r in raw_parsed[1:]:
+                row_dict = {headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))}
+                ts = row_dict.get("Timestamp", "").strip()
+                wid = row_dict.get("Worker_ID", "").strip()
+                if wid.endswith(".0"):
+                    wid = wid[:-2]
+                if not ts or not wid:
+                    continue
 
-            try:
-                dt_obj = parse_ts(ts)
-            except ValueError:
-                return False, f"Invalid Timestamp '{ts}' in Excel. Use YYYY-MM-DD HH:MM format."
+                try:
+                    dt_obj = parse_ts(ts)
+                except ValueError:
+                    return False, f"Invalid Timestamp '{ts}' in Excel. Use YYYY-MM-DD HH:MM format."
 
-            clean_ts = dt_obj.strftime("%Y-%m-%d %H:%M")
-            date_str = dt_obj.strftime("%Y-%m-%d")
-            wname = row_dict.get("Worker_Name", "").strip() or workers_map.get(wid, f"ID {wid}")
-            notes = row_dict.get("Notes", "").strip() or "Excel Manual Edit"
+                clean_ts = dt_obj.strftime("%Y-%m-%d %H:%M")
+                date_str = dt_obj.strftime("%Y-%m-%d")
+                # Always pull the latest name from workers_map if available
+                wname = workers_map.get(wid) or row_dict.get("Worker_Name", "").strip() or f"ID {wid}"
+                notes = row_dict.get("Notes", "").strip() or "Excel Manual Edit"
 
-            updated_day_rows.append({
-                "Timestamp": clean_ts,
-                "Date": date_str,
-                "Worker_ID": wid,
-                "Worker_Name": wname,
-                "Action": row_dict.get("Action", "").strip().upper(),
-                "Notes": notes,
-            })
-            affected_workers.add((wid, date_str))
+                updated_day_rows.append({
+                    "Timestamp": clean_ts,
+                    "Date": date_str,
+                    "Worker_ID": wid,
+                    "Worker_Name": wname,
+                    "Action": row_dict.get("Action", "").strip().upper(),
+                    "Notes": notes,
+                })
+                affected_workers.add((wid, date_str))
 
         with open(LOG_FILE, "r", newline="") as f:
             existing_other_days = [r for r in csv.DictReader(f) if r["Date"] != target_date]
@@ -474,8 +505,9 @@ def sync_from_native_xlsx(target_date):
             writer.writeheader()
             writer.writerows(combined_rows)
 
+        # Regenerate the daily Excel file with updated Workers, Raw_Logs, and Daily_Summary
         export_single_day_xlsx(target_date, combined_rows)
-        return True, f"Synced {len(updated_day_rows)} rows from {filepath} and refreshed Daily_Summary!"
+        return True, f"Synced {len(workers_map)} workers and {len(updated_day_rows)} log rows from {filepath}!"
 
     except PermissionError:
         return False, f"Close {filepath} in Excel first, then click Sync again."
@@ -521,6 +553,42 @@ HTML_PAGE = """<!DOCTYPE html>
   const input = document.getElementById('scanInput');
   const statusEl = document.getElementById('status');
 
+  // Web Audio API Synthesizer for instant acoustic feedback (no external .mp3/.wav needed)
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+  function playTone(freq, duration, type = 'sine', delay = 0) {
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, audioCtx.currentTime + delay);
+    gain.gain.setValueAtTime(0.25, audioCtx.currentTime + delay);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + delay + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start(audioCtx.currentTime + delay);
+    osc.stop(audioCtx.currentTime + delay + duration);
+  }
+
+  function playSound(soundType) {
+    if (soundType === 'IN') {
+      // Pleasant ascending double-chime for Clock IN
+      playTone(587.33, 0.12, 'sine', 0);      // D5
+      playTone(880.00, 0.22, 'sine', 0.12);   // A5
+    } else if (soundType === 'OUT') {
+      // Clear descending double-chime for Clock OUT
+      playTone(659.25, 0.12, 'sine', 0);      // E5
+      playTone(440.00, 0.25, 'sine', 0.12);   // A4
+    } else if (soundType === 'WARN') {
+      // Double neutral beep for cooldown warning
+      playTone(440.00, 0.12, 'triangle', 0);
+      playTone(440.00, 0.12, 'triangle', 0.18);
+    } else {
+      // Low harsh buzz for Invalid / Unknown ID
+      playTone(180.00, 0.35, 'sawtooth', 0);
+    }
+  }
+
   document.addEventListener('click', () => input.focus());
   setInterval(() => {
     const now = new Date();
@@ -538,6 +606,7 @@ HTML_PAGE = """<!DOCTYPE html>
       const data = await res.json();
       statusEl.style.color = data.color;
       statusEl.textContent = data.message;
+      if (data.sound) playSound(data.sound);
     }
   });
 
@@ -618,12 +687,23 @@ class KioskHandler(BaseHTTPRequestHandler):
 
         if self.path == "/scan":
             worker_id = body.get("worker_id", "").strip()
+
+            # 1. Reject Unknown / Unregistered IDs
+            if worker_id not in workers:
+                self._send_json({
+                    "color": "#ef4444",
+                    "sound": "ERROR",
+                    "message": f"INVALID BADGE ID ({worker_id}) — Not registered in workers.csv"
+                })
+                return
+
+            worker_name = workers[worker_id]
             now = datetime.now()
             today_str = now.strftime("%Y-%m-%d")
             ts_str = now.strftime("%Y-%m-%d %H:%M")
-            worker_name = workers.get(worker_id, f"ID {worker_id}")
             today_scans = get_today_scans(worker_id, today_str)
 
+            # 2. Check Double-Scan Cooldown
             if today_scans:
                 last_ts = parse_ts(today_scans[-1]["Timestamp"])
                 elapsed = (now - last_ts).total_seconds()
@@ -631,10 +711,12 @@ class KioskHandler(BaseHTTPRequestHandler):
                     wait_left = max(1, int(COOLDOWN_SECONDS - elapsed))
                     self._send_json({
                         "color": "#f59e0b",
+                        "sound": "WARN",
                         "message": f"DUPLICATE SCAN IGNORED ({worker_name}) — Wait {wait_left}s"
                     })
                     return
 
+            # 3. Record Valid Scan
             action = "IN" if len(today_scans) % 2 == 0 else "OUT"
             with open(LOG_FILE, "a", newline="") as f:
                 csv.writer(f).writerow([ts_str, today_str, worker_id, worker_name, action, "Auto Scan"])
@@ -642,6 +724,7 @@ class KioskHandler(BaseHTTPRequestHandler):
             color = "#22c55e" if action == "IN" else "#ef4444"
             self._send_json({
                 "color": color,
+                "sound": action,
                 "message": f"{worker_name} — Clocked {action} at {now.strftime('%H:%M')}"
             })
 
@@ -651,6 +734,10 @@ class KioskHandler(BaseHTTPRequestHandler):
                 return
 
             worker_id = body.get("worker_id", "").strip()
+            if worker_id not in workers:
+                self._send_json({"message": f"Error: Worker ID {worker_id} is not registered in workers.csv."})
+                return
+
             target_date = body.get("target_date", "").strip()
             missed_time = body.get("missed_time", "").strip()
             full_ts = f"{target_date} {missed_time}"
@@ -662,7 +749,7 @@ class KioskHandler(BaseHTTPRequestHandler):
                 self._send_json({"message": "Invalid format. Use YYYY-MM-DD and HH:MM (e.g., 12:00)."})
                 return
 
-            worker_name = workers.get(worker_id, f"ID {worker_id}")
+            worker_name = workers[worker_id]
             with open(LOG_FILE, "r", newline="") as f:
                 rows = list(csv.DictReader(f))
 
