@@ -14,11 +14,13 @@ LOG_FILE = "raw_logs.csv"
 WORKERS_FILE = "workers.csv"
 REPORT_PREFIX = "Warehouse_Report_"  # Generates Warehouse_Report_YYYY-MM-DD.xlsx
 COOLDOWN_SECONDS = 20
+SHIFT_CUTOFF_HOUR = 6  # Scans before 06:00 AM belong to the previous day's shift
 ADMIN_PIN = "1234"
 PORT = 8080
 
 
 def init_files():
+    """Checks for existence of raw_logs.csv and workers.csv, and creates them with headers if missing."""
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, "w", newline="") as f:
             csv.writer(f).writerow(["Timestamp", "Date", "Worker_ID", "Worker_Name", "Action", "Notes"])
@@ -30,6 +32,7 @@ def init_files():
 
 
 def load_workers():
+    """Opens workers.csv and returns a Python dictionary mapping Worker_ID to Worker_Name."""
     workers = {}
     with open(WORKERS_FILE, "r", newline="") as f:
         for row in csv.DictReader(f):
@@ -43,6 +46,7 @@ def parse_ts(ts_val):
 
     try:
         serial = float(s)
+        # Excel's serial date system starts on 1899-12-30, and fractional days represent time.
         dt = datetime(1899, 12, 30) + timedelta(days=serial)
         if dt.second >= 30:
             dt += timedelta(minutes=1)
@@ -69,12 +73,21 @@ def parse_ts(ts_val):
     raise ValueError(f"Invalid timestamp format: {s}")
 
 
-def get_today_scans(worker_id, today_str):
+def get_shift_date(dt_obj):
+    """Assigns scans before SHIFT_CUTOFF_HOUR (06:00) to the previous day's shift."""
+    if dt_obj.hour < SHIFT_CUTOFF_HOUR:
+        return (dt_obj - timedelta(days=1)).strftime("%Y-%m-%d")
+    return dt_obj.strftime("%Y-%m-%d")
+
+
+def get_today_scans(worker_id, shift_date_str):
+    """Reads raw_logs.csv and returns a list of all scans belonging to a specific worker on a specific shift date."""
     with open(LOG_FILE, "r", newline="") as f:
-        return [r for r in csv.DictReader(f) if r["Worker_ID"] == worker_id and r["Date"] == today_str]
+        return [r for r in csv.DictReader(f) if r["Worker_ID"] == worker_id and r["Date"] == shift_date_str]
 
 
 def recalculate_worker_day(rows, worker_id, target_date):
+    """Autocorrects IN/OUT timestamps for a specific worker on a specific date."""
     rows.sort(key=lambda r: parse_ts(r["Timestamp"]))
     scan_index = 0
     for row in rows:
@@ -92,6 +105,7 @@ def recalculate_worker_day(rows, worker_id, target_date):
 # .XLSX WRITER & READER 
 # ==============================================================================
 def _col_letter(n):
+    """Converts a 1-based column index to Excel-style letters (e.g., 1 -> A, 27 -> AA)."""
     res = ""
     while n > 0:
         n, rem = divmod(n - 1, 26)
@@ -100,6 +114,7 @@ def _col_letter(n):
 
 
 def _col_index_from_ref(cell_ref):
+    """Converts an Excel-style cell coordinate to a 0-based column index."""
     letters = "".join(ch for ch in cell_ref if ch.isalpha())
     idx = 0
     for ch in letters:
@@ -108,8 +123,11 @@ def _col_index_from_ref(cell_ref):
 
 
 def _build_worksheet_xml(headers, data_rows, status_col_idx=None):
+    """Builds the XML content for a single worksheet in an .xlsx file."""
+    # Combine headers and data rows for column width calculations
     all_rows = [headers] + data_rows
 
+    # Determine column widths based on the maximum length of content in each column
     cols_xml = ["<cols>"]
     for c_idx in range(len(headers)):
         max_len = max((len(str(r[c_idx])) for r in all_rows if c_idx < len(r)), default=10)
@@ -117,6 +135,7 @@ def _build_worksheet_xml(headers, data_rows, status_col_idx=None):
         cols_xml.append(f'<col min="{c_idx + 1}" max="{c_idx + 1}" width="{width}" customWidth="1"/>')
     cols_xml.append("</cols>")
 
+    # Build the sheetData XML with rows and cells
     rows_xml = ["<sheetData>"]
     for r_idx, row in enumerate(all_rows, start=1):
         rows_xml.append(f'<row r="{r_idx}">')
@@ -147,6 +166,7 @@ def _build_worksheet_xml(headers, data_rows, status_col_idx=None):
 
 
 def write_native_xlsx(filepath, sheets):
+    """Writes multiple sheets to a native .xlsx file using only the standard library."""
     content_types = [
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
         '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
@@ -225,6 +245,7 @@ def write_native_xlsx(filepath, sheets):
   </cellXfs>
 </styleSheet>"""
 
+    # Write all XML components to the .xlsx ZipFile
     with zipfile.ZipFile(filepath, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("[Content_Types].xml", "".join(content_types))
         zf.writestr("_rels/.rels", root_rels)
@@ -236,6 +257,7 @@ def write_native_xlsx(filepath, sheets):
 
 
 def export_single_day_xlsx(target_date, all_rows):
+    """Exports a single day's logs to an Excel file with three tabs: Daily_Summary, Raw_Logs, and Workers."""
     day_rows = [r for r in all_rows if r["Date"] == target_date]
     if not day_rows:
         return None
@@ -344,6 +366,7 @@ def export_single_day_xlsx(target_date, all_rows):
 
 
 def generate_excel_reports(target_date=None):
+    """Generates Excel reports for either a specific date or all dates found in raw_logs.csv."""
     with open(LOG_FILE, "r", newline="") as f:
         rows = list(csv.DictReader(f))
 
@@ -353,7 +376,7 @@ def generate_excel_reports(target_date=None):
     if target_date:
         created = export_single_day_xlsx(target_date, rows)
         if not created:
-            return False, f"No logs found for {target_date}."
+            return False, f"No logs found for shift date {target_date}."
         return True, f"Exported {created}."
 
     unique_dates = sorted({r["Date"] for r in rows if r["Date"]})
@@ -367,7 +390,7 @@ def generate_excel_reports(target_date=None):
 
 
 def _parse_xlsx_sheet(zf, sheet_name, shared_strings, ns_main):
-    """Helper to extract rows from a specific named worksheet inside an open .xlsx ZipFile."""
+    """Extracts rows from a specific named worksheet(Raw_Logs or Workers) inside an open .xlsx ZipFile."""
     wb_root = ET.fromstring(zf.read("xl/workbook.xml"))
     rels_root = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
     rel_map = {rel.attrib["Id"]: rel.attrib["Target"] for rel in rels_root}
@@ -411,7 +434,7 @@ def _parse_xlsx_sheet(zf, sheet_name, shared_strings, ns_main):
 
 
 def sync_from_native_xlsx(target_date):
-    """Syncs both the Workers tab (to workers.csv) and Raw_Logs tab (to raw_logs.csv) from Warehouse_Report_YYYY-MM-DD.xlsx."""
+    """Syncs both Workers (to workers.csv) and Raw_Logs (to raw_logs.csv) from Warehouse_Report_YYYY-MM-DD.xlsx."""
     filepath = f"{REPORT_PREFIX}{target_date}.xlsx"
     if not os.path.exists(filepath):
         return False, f"{filepath} not found. Export the Excel file first."
@@ -433,7 +456,7 @@ def sync_from_native_xlsx(target_date):
         if raw_parsed is None:
             return False, "Could not find the 'Raw_Logs' tab inside the Excel workbook."
 
-        # 1. Sync Workers tab -> workers.csv (if Workers tab exists and has rows)
+        # 1. Sync Workers tab -> workers.csv
         workers_map = load_workers()
         if workers_parsed and len(workers_parsed) >= 2:
             w_headers = workers_parsed[0]
@@ -442,7 +465,6 @@ def sync_from_native_xlsx(target_date):
                 w_dict = {w_headers[i]: (r[i] if i < len(r) else "") for i in range(len(w_headers))}
                 wid = w_dict.get("Worker_ID", "").strip()
                 wname = w_dict.get("Worker_Name", "").strip()
-                # Normalize float-formatted IDs if Excel turned "1355" into "1355.0"
                 if wid.endswith(".0"):
                     wid = wid[:-2]
                 if wid and wname:
@@ -456,7 +478,7 @@ def sync_from_native_xlsx(target_date):
                     for wid, wname in sorted(workers_map.items()):
                         writer.writerow([wid, wname])
 
-        # 2. Sync Raw_Logs tab -> raw_logs.csv
+        # 2. Sync Raw_Logs tab -> raw_logs.csv (using shift-date grouping)
         updated_day_rows = []
         affected_workers = set()
 
@@ -477,20 +499,19 @@ def sync_from_native_xlsx(target_date):
                     return False, f"Invalid Timestamp '{ts}' in Excel. Use YYYY-MM-DD HH:MM format."
 
                 clean_ts = dt_obj.strftime("%Y-%m-%d %H:%M")
-                date_str = dt_obj.strftime("%Y-%m-%d")
-                # Always pull the latest name from workers_map if available
+                shift_date = get_shift_date(dt_obj)
                 wname = workers_map.get(wid) or row_dict.get("Worker_Name", "").strip() or f"ID {wid}"
                 notes = row_dict.get("Notes", "").strip() or "Excel Manual Edit"
 
                 updated_day_rows.append({
                     "Timestamp": clean_ts,
-                    "Date": date_str,
+                    "Date": shift_date,
                     "Worker_ID": wid,
                     "Worker_Name": wname,
                     "Action": row_dict.get("Action", "").strip().upper(),
                     "Notes": notes,
                 })
-                affected_workers.add((wid, date_str))
+                affected_workers.add((wid, shift_date))
 
         with open(LOG_FILE, "r", newline="") as f:
             existing_other_days = [r for r in csv.DictReader(f) if r["Date"] != target_date]
@@ -505,7 +526,6 @@ def sync_from_native_xlsx(target_date):
             writer.writeheader()
             writer.writerows(combined_rows)
 
-        # Regenerate the daily Excel file with updated Workers, Raw_Logs, and Daily_Summary
         export_single_day_xlsx(target_date, combined_rows)
         return True, f"Synced {len(workers_map)} workers and {len(updated_day_rows)} log rows from {filepath}!"
 
@@ -550,43 +570,58 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 
 <script>
+  const SHIFT_CUTOFF_HOUR = __SHIFT_CUTOFF_HOUR__;
   const input = document.getElementById('scanInput');
   const statusEl = document.getElementById('status');
 
-  // Web Audio API Synthesizer for instant acoustic feedback (no external .mp3/.wav needed)
-  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  // Web Audio API Synthesizer for instant acoustic feedback
+  let audioCtx = null;
 
   function playTone(freq, duration, type = 'sine', delay = 0) {
-    if (audioCtx.state === 'suspended') audioCtx.resume();
-    const osc = audioCtx.createOscillator();
-    const gain = audioCtx.createGain();
-    osc.type = type;
-    osc.frequency.setValueAtTime(freq, audioCtx.currentTime + delay);
-    gain.gain.setValueAtTime(0.25, audioCtx.currentTime + delay);
-    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + delay + duration);
-    osc.connect(gain);
-    gain.connect(audioCtx.destination);
-    osc.start(audioCtx.currentTime + delay);
-    osc.stop(audioCtx.currentTime + delay + duration);
+    try {
+      if (!audioCtx) {
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        if (AudioContextClass) audioCtx = new AudioContextClass();
+      }
+      if (!audioCtx) return;
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, audioCtx.currentTime + delay);
+      gain.gain.setValueAtTime(0.25, audioCtx.currentTime + delay);
+      gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + delay + duration);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start(audioCtx.currentTime + delay);
+      osc.stop(audioCtx.currentTime + delay + duration);
+    } catch (err) {
+      console.warn('Audio playback skipped:', err);
+    }
   }
 
   function playSound(soundType) {
     if (soundType === 'IN') {
-      // Pleasant ascending double-chime for Clock IN
-      playTone(587.33, 0.12, 'sine', 0);      // D5
-      playTone(880.00, 0.22, 'sine', 0.12);   // A5
+      playTone(587.33, 0.12, 'sine', 0);
+      playTone(880.00, 0.22, 'sine', 0.12);
     } else if (soundType === 'OUT') {
-      // Clear descending double-chime for Clock OUT
-      playTone(659.25, 0.12, 'sine', 0);      // E5
-      playTone(440.00, 0.25, 'sine', 0.12);   // A4
+      playTone(659.25, 0.12, 'sine', 0);
+      playTone(440.00, 0.25, 'sine', 0.12);
     } else if (soundType === 'WARN') {
-      // Double neutral beep for cooldown warning
       playTone(440.00, 0.12, 'triangle', 0);
       playTone(440.00, 0.12, 'triangle', 0.18);
     } else {
-      // Low harsh buzz for Invalid / Unknown ID
       playTone(180.00, 0.35, 'sawtooth', 0);
     }
+  }
+
+  function getActiveShiftDate() {
+    const now = new Date();
+    if (now.getHours() < SHIFT_CUTOFF_HOUR) {
+      now.setDate(now.getDate() - 1);
+    }
+    return now.toLocaleDateString('en-CA');
   }
 
   document.addEventListener('click', () => input.focus());
@@ -599,14 +634,25 @@ HTML_PAGE = """<!DOCTYPE html>
 
   input.addEventListener('keydown', async (e) => {
     if (e.key === 'Enter') {
+      e.preventDefault();
       const code = input.value.trim();
       input.value = '';
       if (!code) return;
-      const res = await fetch('/scan', { method: 'POST', body: JSON.stringify({ worker_id: code }) });
-      const data = await res.json();
-      statusEl.style.color = data.color;
-      statusEl.textContent = data.message;
-      if (data.sound) playSound(data.sound);
+
+      try {
+        const res = await fetch('/scan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ worker_id: code })
+        });
+        const data = await res.json();
+        statusEl.style.color = data.color;
+        statusEl.textContent = data.message;
+        if (data.sound) playSound(data.sound);
+      } catch (err) {
+        statusEl.style.color = '#ef4444';
+        statusEl.textContent = 'Connection error: Make sure clock_kiosk.py is running.';
+      }
     }
   });
 
@@ -615,13 +661,14 @@ HTML_PAGE = """<!DOCTYPE html>
     if (!pin) return;
     const worker_id = prompt("Enter Worker 4-Digit ID:");
     if (!worker_id) return;
-    const target_date = prompt("Enter Date (YYYY-MM-DD):", new Date().toLocaleDateString('en-CA'));
+    const target_date = prompt("Enter Actual Calendar Date of Missed Punch (YYYY-MM-DD):", new Date().toLocaleDateString('en-CA'));
     if (!target_date) return;
-    const missed_time = prompt("Enter Missed Time (HH:MM, 24h format), e.g., 12:00:");
+    const missed_time = prompt("Enter Missed Time (HH:MM, 24h format), e.g., 02:30 or 12:00:");
     if (!missed_time) return;
 
     const res = await fetch('/fix', {
       method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ pin, worker_id, target_date, missed_time })
     });
     const data = await res.json();
@@ -630,15 +677,23 @@ HTML_PAGE = """<!DOCTYPE html>
   }
 
   async function exportTodayExcel() {
-    const today = new Date().toLocaleDateString('en-CA');
-    const res = await fetch('/export', { method: 'POST', body: JSON.stringify({ target_date: today }) });
+    const activeShift = getActiveShiftDate();
+    const res = await fetch('/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target_date: activeShift })
+    });
     const data = await res.json();
     alert(data.message);
     input.focus();
   }
 
   async function exportAllExcel() {
-    const res = await fetch('/export', { method: 'POST', body: JSON.stringify({}) });
+    const res = await fetch('/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
     const data = await res.json();
     alert(data.message);
     input.focus();
@@ -647,11 +702,12 @@ HTML_PAGE = """<!DOCTYPE html>
   async function syncExcel() {
     const pin = prompt("Enter Supervisor PIN to sync manual Excel edits:");
     if (!pin) return;
-    const target_date = prompt("Enter the Date of the Excel file to sync (YYYY-MM-DD):", new Date().toLocaleDateString('en-CA'));
+    const target_date = prompt("Enter the Shift Date of the Excel file to sync (YYYY-MM-DD):", getActiveShiftDate());
     if (!target_date) return;
 
     const res = await fetch('/sync', {
       method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ pin, target_date })
     });
     const data = await res.json();
@@ -665,6 +721,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
 
 class KioskHandler(BaseHTTPRequestHandler):
+    """Inherits from Python's BaseHTTPRequestHandler and acts as the backend API that talks to the HTML/JavaScript frontend"""
     def log_message(self, format, *args):
         pass
 
@@ -699,9 +756,9 @@ class KioskHandler(BaseHTTPRequestHandler):
 
             worker_name = workers[worker_id]
             now = datetime.now()
-            today_str = now.strftime("%Y-%m-%d")
+            shift_date_str = get_shift_date(now)
             ts_str = now.strftime("%Y-%m-%d %H:%M")
-            today_scans = get_today_scans(worker_id, today_str)
+            today_scans = get_today_scans(worker_id, shift_date_str)
 
             # 2. Check Double-Scan Cooldown
             if today_scans:
@@ -716,10 +773,10 @@ class KioskHandler(BaseHTTPRequestHandler):
                     })
                     return
 
-            # 3. Record Valid Scan
+            # 3. Record Valid Scan under active shift date
             action = "IN" if len(today_scans) % 2 == 0 else "OUT"
             with open(LOG_FILE, "a", newline="") as f:
-                csv.writer(f).writerow([ts_str, today_str, worker_id, worker_name, action, "Auto Scan"])
+                csv.writer(f).writerow([ts_str, shift_date_str, worker_id, worker_name, action, "Auto Scan"])
 
             color = "#22c55e" if action == "IN" else "#ef4444"
             self._send_json({
@@ -745,6 +802,7 @@ class KioskHandler(BaseHTTPRequestHandler):
             try:
                 dt_obj = parse_ts(full_ts)
                 clean_ts = dt_obj.strftime("%Y-%m-%d %H:%M")
+                shift_date = get_shift_date(dt_obj)
             except ValueError:
                 self._send_json({"message": "Invalid format. Use YYYY-MM-DD and HH:MM (e.g., 12:00)."})
                 return
@@ -754,10 +812,10 @@ class KioskHandler(BaseHTTPRequestHandler):
                 rows = list(csv.DictReader(f))
 
             rows.append({
-                "Timestamp": clean_ts, "Date": target_date, "Worker_ID": worker_id,
+                "Timestamp": clean_ts, "Date": shift_date, "Worker_ID": worker_id,
                 "Worker_Name": worker_name, "Action": "", "Notes": "Supervisor Manual Fix"
             })
-            rows = recalculate_worker_day(rows, worker_id, target_date)
+            rows = recalculate_worker_day(rows, worker_id, shift_date)
 
             with open(LOG_FILE, "w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=["Timestamp", "Date", "Worker_ID", "Worker_Name", "Action", "Notes"])
@@ -765,7 +823,7 @@ class KioskHandler(BaseHTTPRequestHandler):
                 writer.writerows(rows)
 
             assigned = next((r["Action"] for r in rows if r["Worker_ID"] == worker_id and r["Timestamp"] == clean_ts), "UPDATED")
-            self._send_json({"message": f"Inserted {assigned} at {clean_ts} for {worker_name} and recalculated day."})
+            self._send_json({"message": f"Inserted {assigned} at {clean_ts} (Shift {shift_date}) for {worker_name}."})
 
         elif self.path == "/export":
             target_date = body.get("target_date", "").strip() or None
@@ -788,6 +846,6 @@ class ReusableHTTPServer(HTTPServer):
 if __name__ == "__main__":
     init_files()
     server = ReusableHTTPServer(("127.0.0.1", PORT), KioskHandler)
-    print(f"Kiosk running at http://127.0.0.1:{PORT}")
+    print(f"Kiosk running at http://127.0.0.1:{PORT} | Shift cutoff: {SHIFT_CUTOFF_HOUR:02d}:00")
     Timer(0.8, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}")).start()
     server.serve_forever()
