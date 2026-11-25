@@ -20,6 +20,7 @@ PORT = 8080
 
 
 def init_files():
+    """Checks for existence of raw_logs.csv and workers.csv, and creates them with headers if missing."""
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, "w", newline="") as f:
             csv.writer(f).writerow(["Timestamp", "Date", "Worker_ID", "Worker_Name", "Action", "Notes"])
@@ -31,6 +32,7 @@ def init_files():
 
 
 def load_workers():
+    """Opens workers.csv and returns a Python dictionary mapping Worker_ID to Worker_Name."""
     workers = {}
     with open(WORKERS_FILE, "r", newline="") as f:
         for row in csv.DictReader(f):
@@ -44,6 +46,7 @@ def parse_ts(ts_val):
 
     try:
         serial = float(s)
+        # Excel's serial date system starts on 1899-12-30, and fractional days represent time.
         dt = datetime(1899, 12, 30) + timedelta(days=serial)
         if dt.second >= 30:
             dt += timedelta(minutes=1)
@@ -71,18 +74,20 @@ def parse_ts(ts_val):
 
 
 def get_shift_date(dt_obj):
-    """Assigns scans before SHIFT_CUTOFF_HOUR (e.g., 06:00) to the previous day's shift."""
+    """Assigns scans before SHIFT_CUTOFF_HOUR (06:00) to the previous day's shift."""
     if dt_obj.hour < SHIFT_CUTOFF_HOUR:
         return (dt_obj - timedelta(days=1)).strftime("%Y-%m-%d")
     return dt_obj.strftime("%Y-%m-%d")
 
 
 def get_today_scans(worker_id, shift_date_str):
+    """Reads raw_logs.csv and returns a list of all scans belonging to a specific worker on a specific shift date."""
     with open(LOG_FILE, "r", newline="") as f:
         return [r for r in csv.DictReader(f) if r["Worker_ID"] == worker_id and r["Date"] == shift_date_str]
 
 
 def recalculate_worker_day(rows, worker_id, target_date):
+    """Autocorrects IN/OUT timestamps for a specific worker on a specific date."""
     rows.sort(key=lambda r: parse_ts(r["Timestamp"]))
     scan_index = 0
     for row in rows:
@@ -97,9 +102,10 @@ def recalculate_worker_day(rows, worker_id, target_date):
 
 
 # ==============================================================================
-# NATIVE .XLSX WRITER & READER (Zero external packages)
+# .XLSX WRITER & READER 
 # ==============================================================================
 def _col_letter(n):
+    """Converts a 1-based column index to Excel-style letters (e.g., 1 -> A, 27 -> AA)."""
     res = ""
     while n > 0:
         n, rem = divmod(n - 1, 26)
@@ -108,6 +114,7 @@ def _col_letter(n):
 
 
 def _col_index_from_ref(cell_ref):
+    """Converts an Excel-style cell coordinate to a 0-based column index."""
     letters = "".join(ch for ch in cell_ref if ch.isalpha())
     idx = 0
     for ch in letters:
@@ -116,8 +123,11 @@ def _col_index_from_ref(cell_ref):
 
 
 def _build_worksheet_xml(headers, data_rows, status_col_idx=None):
+    """Builds the XML content for a single worksheet in an .xlsx file."""
+    # Combine headers and data rows for column width calculations
     all_rows = [headers] + data_rows
 
+    # Determine column widths based on the maximum length of content in each column
     cols_xml = ["<cols>"]
     for c_idx in range(len(headers)):
         max_len = max((len(str(r[c_idx])) for r in all_rows if c_idx < len(r)), default=10)
@@ -125,6 +135,7 @@ def _build_worksheet_xml(headers, data_rows, status_col_idx=None):
         cols_xml.append(f'<col min="{c_idx + 1}" max="{c_idx + 1}" width="{width}" customWidth="1"/>')
     cols_xml.append("</cols>")
 
+    # Build the sheetData XML with rows and cells
     rows_xml = ["<sheetData>"]
     for r_idx, row in enumerate(all_rows, start=1):
         rows_xml.append(f'<row r="{r_idx}">')
@@ -155,6 +166,7 @@ def _build_worksheet_xml(headers, data_rows, status_col_idx=None):
 
 
 def write_native_xlsx(filepath, sheets):
+    """Writes multiple sheets to a native .xlsx file using only the standard library."""
     content_types = [
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
         '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
@@ -233,6 +245,7 @@ def write_native_xlsx(filepath, sheets):
   </cellXfs>
 </styleSheet>"""
 
+    # Write all XML components to the .xlsx ZipFile
     with zipfile.ZipFile(filepath, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("[Content_Types].xml", "".join(content_types))
         zf.writestr("_rels/.rels", root_rels)
@@ -244,6 +257,7 @@ def write_native_xlsx(filepath, sheets):
 
 
 def export_single_day_xlsx(target_date, all_rows):
+    """Exports a single day's logs to an Excel file with three tabs: Daily_Summary, Raw_Logs, and Workers."""
     day_rows = [r for r in all_rows if r["Date"] == target_date]
     if not day_rows:
         return None
@@ -352,6 +366,7 @@ def export_single_day_xlsx(target_date, all_rows):
 
 
 def generate_excel_reports(target_date=None):
+    """Generates Excel reports for either a specific date or all dates found in raw_logs.csv."""
     with open(LOG_FILE, "r", newline="") as f:
         rows = list(csv.DictReader(f))
 
@@ -375,7 +390,7 @@ def generate_excel_reports(target_date=None):
 
 
 def _parse_xlsx_sheet(zf, sheet_name, shared_strings, ns_main):
-    """Extracts rows from a specific named worksheet inside an open .xlsx ZipFile."""
+    """Extracts rows from a specific named worksheet(Raw_Logs or Workers) inside an open .xlsx ZipFile."""
     wb_root = ET.fromstring(zf.read("xl/workbook.xml"))
     rels_root = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
     rel_map = {rel.attrib["Id"]: rel.attrib["Target"] for rel in rels_root}
@@ -520,25 +535,25 @@ def sync_from_native_xlsx(target_date):
         return False, f"Sync error: {e}"
 
 
-HTML_PAGE = f"""<!DOCTYPE html>
+HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <title>Warehouse Time Clock</title>
 <style>
-  body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #1e293b; color: #f8fafc;
-         display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
-  h1 {{ font-size: 2.4rem; margin-bottom: 0.3rem; }}
-  #clock {{ font-size: 1.5rem; color: #94a3b8; margin-bottom: 2rem; }}
-  input {{ font-size: 2.5rem; text-align: center; width: 260px; padding: 12px; border-radius: 10px;
-          border: 3px solid #38bdf8; outline: none; font-weight: bold; }}
-  #status {{ margin-top: 2rem; font-size: 1.6rem; font-weight: bold; min-height: 3.5rem; text-align: center; max-width: 700px; }}
-  .controls {{ position: fixed; bottom: 24px; display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; }}
-  button {{ padding: 10px 16px; font-size: 0.92rem; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; }}
-  .btn-fix {{ background: #334155; color: #e2e8f0; }}
-  .btn-export {{ background: #0f766e; color: #fff; }}
-  .btn-export-all {{ background: #115e59; color: #cbd5e1; }}
-  .btn-sync {{ background: #1d4ed8; color: #fff; }}
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #1e293b; color: #f8fafc;
+         display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+  h1 { font-size: 2.4rem; margin-bottom: 0.3rem; }
+  #clock { font-size: 1.5rem; color: #94a3b8; margin-bottom: 2rem; }
+  input { font-size: 2.5rem; text-align: center; width: 260px; padding: 12px; border-radius: 10px;
+          border: 3px solid #38bdf8; outline: none; font-weight: bold; }
+  #status { margin-top: 2rem; font-size: 1.6rem; font-weight: bold; min-height: 3.5rem; text-align: center; max-width: 700px; }
+  .controls { position: fixed; bottom: 24px; display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; }
+  button { padding: 10px 16px; font-size: 0.92rem; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; }
+  .btn-fix { background: #334155; color: #e2e8f0; }
+  .btn-export { background: #0f766e; color: #fff; }
+  .btn-export-all { background: #115e59; color: #cbd5e1; }
+  .btn-sync { background: #1d4ed8; color: #fff; }
 </style>
 </head>
 <body>
@@ -555,72 +570,93 @@ HTML_PAGE = f"""<!DOCTYPE html>
   </div>
 
 <script>
-  const SHIFT_CUTOFF_HOUR = {SHIFT_CUTOFF_HOUR};
+  const SHIFT_CUTOFF_HOUR = __SHIFT_CUTOFF_HOUR__;
   const input = document.getElementById('scanInput');
   const statusEl = document.getElementById('status');
 
   // Web Audio API Synthesizer for instant acoustic feedback
-  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  let audioCtx = null;
 
-  function playTone(freq, duration, type = 'sine', delay = 0) {{
-    if (audioCtx.state === 'suspended') audioCtx.resume();
-    const osc = audioCtx.createOscillator();
-    const gain = audioCtx.createGain();
-    osc.type = type;
-    osc.frequency.setValueAtTime(freq, audioCtx.currentTime + delay);
-    gain.gain.setValueAtTime(0.25, audioCtx.currentTime + delay);
-    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + delay + duration);
-    osc.connect(gain);
-    gain.connect(audioCtx.destination);
-    osc.start(audioCtx.currentTime + delay);
-    osc.stop(audioCtx.currentTime + delay + duration);
-  }}
+  function playTone(freq, duration, type = 'sine', delay = 0) {
+    try {
+      if (!audioCtx) {
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        if (AudioContextClass) audioCtx = new AudioContextClass();
+      }
+      if (!audioCtx) return;
+      if (audioCtx.state === 'suspended') audioCtx.resume();
 
-  function playSound(soundType) {{
-    if (soundType === 'IN') {{
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, audioCtx.currentTime + delay);
+      gain.gain.setValueAtTime(0.25, audioCtx.currentTime + delay);
+      gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + delay + duration);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start(audioCtx.currentTime + delay);
+      osc.stop(audioCtx.currentTime + delay + duration);
+    } catch (err) {
+      console.warn('Audio playback skipped:', err);
+    }
+  }
+
+  function playSound(soundType) {
+    if (soundType === 'IN') {
       playTone(587.33, 0.12, 'sine', 0);
       playTone(880.00, 0.22, 'sine', 0.12);
-    }} else if (soundType === 'OUT') {{
+    } else if (soundType === 'OUT') {
       playTone(659.25, 0.12, 'sine', 0);
       playTone(440.00, 0.25, 'sine', 0.12);
-    }} else if (soundType === 'WARN') {{
+    } else if (soundType === 'WARN') {
       playTone(440.00, 0.12, 'triangle', 0);
       playTone(440.00, 0.12, 'triangle', 0.18);
-    }} else {{
+    } else {
       playTone(180.00, 0.35, 'sawtooth', 0);
-    }}
-  }}
+    }
+  }
 
-  function getActiveShiftDate() {{
+  function getActiveShiftDate() {
     const now = new Date();
-    if (now.getHours() < SHIFT_CUTOFF_HOUR) {{
+    if (now.getHours() < SHIFT_CUTOFF_HOUR) {
       now.setDate(now.getDate() - 1);
-    }}
+    }
     return now.toLocaleDateString('en-CA');
-  }}
+  }
 
   document.addEventListener('click', () => input.focus());
-  setInterval(() => {{
+  setInterval(() => {
     const now = new Date();
     const hh = String(now.getHours()).padStart(2, '0');
     const mm = String(now.getMinutes()).padStart(2, '0');
     document.getElementById('clock').textContent = now.toLocaleDateString('en-CA') + '  |  ' + hh + ':' + mm;
-  }}, 500);
+  }, 500);
 
-  input.addEventListener('keydown', async (e) => {{
-    if (e.key === 'Enter') {{
+  input.addEventListener('keydown', async (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
       const code = input.value.trim();
       input.value = '';
       if (!code) return;
-      const res = await fetch('/scan', {{ method: 'POST', body: JSON.stringify({{ worker_id: code }}) }});
-      const data = await res.json();
-      statusEl.style.color = data.color;
-      statusEl.textContent = data.message;
-      if (data.sound) playSound(data.sound);
-    }}
-  }});
 
-  async function supervisorFix() {{
+      try {
+        const res = await fetch('/scan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ worker_id: code })
+        });
+        const data = await res.json();
+        statusEl.style.color = data.color;
+        statusEl.textContent = data.message;
+        if (data.sound) playSound(data.sound);
+      } catch (err) {
+        statusEl.style.color = '#ef4444';
+        statusEl.textContent = 'Connection error: Make sure clock_kiosk.py is running.';
+      }
+    }
+  });
+
+  async function supervisorFix() {
     const pin = prompt("Enter Supervisor PIN:");
     if (!pin) return;
     const worker_id = prompt("Enter Worker 4-Digit ID:");
@@ -630,44 +666,54 @@ HTML_PAGE = f"""<!DOCTYPE html>
     const missed_time = prompt("Enter Missed Time (HH:MM, 24h format), e.g., 02:30 or 12:00:");
     if (!missed_time) return;
 
-    const res = await fetch('/fix', {{
+    const res = await fetch('/fix', {
       method: 'POST',
-      body: JSON.stringify({{ pin, worker_id, target_date, missed_time }})
-    }});
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin, worker_id, target_date, missed_time })
+    });
     const data = await res.json();
     alert(data.message);
     input.focus();
-  }}
+  }
 
-  async function exportTodayExcel() {{
+  async function exportTodayExcel() {
     const activeShift = getActiveShiftDate();
-    const res = await fetch('/export', {{ method: 'POST', body: JSON.stringify({{ target_date: activeShift }}) }});
+    const res = await fetch('/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target_date: activeShift })
+    });
     const data = await res.json();
     alert(data.message);
     input.focus();
-  }}
+  }
 
-  async function exportAllExcel() {{
-    const res = await fetch('/export', {{ method: 'POST', body: JSON.stringify({{}}) }});
+  async function exportAllExcel() {
+    const res = await fetch('/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
     const data = await res.json();
     alert(data.message);
     input.focus();
-  }}
+  }
 
-  async function syncExcel() {{
+  async function syncExcel() {
     const pin = prompt("Enter Supervisor PIN to sync manual Excel edits:");
     if (!pin) return;
     const target_date = prompt("Enter the Shift Date of the Excel file to sync (YYYY-MM-DD):", getActiveShiftDate());
     if (!target_date) return;
 
-    const res = await fetch('/sync', {{
+    const res = await fetch('/sync', {
       method: 'POST',
-      body: JSON.stringify({{ pin, target_date }})
-    }});
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin, target_date })
+    });
     const data = await res.json();
     alert(data.message);
     input.focus();
-  }}
+  }
 </script>
 </body>
 </html>
@@ -675,6 +721,7 @@ HTML_PAGE = f"""<!DOCTYPE html>
 
 
 class KioskHandler(BaseHTTPRequestHandler):
+    """Inherits from Python's BaseHTTPRequestHandler and acts as the backend API that talks to the HTML/JavaScript frontend"""
     def log_message(self, format, *args):
         pass
 
